@@ -6,6 +6,7 @@
 # apt install -y git moreutils
 # note: This script should run on branch "main".
 
+set -o xtrace
 set -eu
 
 if [ $# -ne 1 ]; then
@@ -32,7 +33,7 @@ fi
 prevtag=v0.2.0
 pkgname=`cat ${PACKGE_DIR}/control | grep '^Package: ' | sed 's/^Package: //'`
 git tag -l v* | sort -V | while read tag; do
-    (echo "$pkgname (${tag#v}) unstable; urgency=low"; git log --pretty=format:'  * %s' $prevtag..$tag; git log --pretty='format:%n%n -- %aN <%aE>  %aD%n%n' $tag^..$tag) | cat - ${CHANGE_LOG} | sponge ${CHANGE_LOG}
+    (echo "$pkgname (${tag#v}) unstable; urgency=low"; git log -3 --pretty=format:'  * %s'; git log -3 --pretty='format:%n%n -- %aN <%aE>  %aD%n%n') | cat - ${CHANGE_LOG} | sponge ${CHANGE_LOG}
         prevtag=$tag
 done
 if [ -f ${CHANGE_LOG} ]; then

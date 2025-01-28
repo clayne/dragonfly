@@ -16,7 +16,7 @@
 # Params:
 #	* optional location to the binary to place at the package
 
-
+set -o xtrace
 set -eu
 
 
