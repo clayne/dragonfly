@@ -108,6 +108,10 @@ template <typename T, typename Policy = BPTreePolicy<T>> class BPTree {
   /// Replaces old with new_obj.
   void ForceUpdate(KeyT old, KeyT new_obj);
 
+  bool LocateDebug(KeyT key, BPTreePath* path) const {
+    return Locate(key, path);
+  }
+
  private:
   BPTreeNode* CreateNode(bool leaf);
 

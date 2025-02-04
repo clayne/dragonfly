@@ -67,10 +67,10 @@ struct GeoPoint {
   double dist;
   double score;
   std::string member;
-  GeoPoint() : longitude(0.0), latitude(0.0), dist(0.0), score(0.0){};
+  GeoPoint() : longitude(0.0), latitude(0.0), dist(0.0), score(0.0) {};
   GeoPoint(double _longitude, double _latitude, double _dist, double _score,
            const std::string& _member)
-      : longitude(_longitude), latitude(_latitude), dist(_dist), score(_score), member(_member){};
+      : longitude(_longitude), latitude(_latitude), dist(_dist), score(_score), member(_member) {};
 };
 using GeoArray = std::vector<GeoPoint>;
 
@@ -301,6 +301,8 @@ class IntervalVisitor {
   unsigned removed() const {
     return removed_;
   }
+
+  bool has_bug = false;
 
  private:
   void ExtractListPack(const zrangespec& range);
@@ -554,6 +556,9 @@ void IntervalVisitor::ExtractSkipList(const zrangespec& range) {
   unsigned limit = params_.limit;
 
   result_ = zs->GetRange(range, offset, limit, params_.reverse);
+  if (result_.empty() && zs->has_bug) {
+    has_bug = true;
+  }
 }
 
 void IntervalVisitor::ExtractListPack(const zlexrangespec& range) {
@@ -1337,6 +1342,88 @@ auto OpPopCount(const ZSetFamily::ZRangeSpec& range_spec, const OpArgs& op_args,
   return iv.PopResult();
 }
 
+static double GetObjScore(const void* obj) {
+  constexpr uint64_t kSdsMask = (1ULL << 60) - 1;
+
+  sds s = (sds)(uint64_t(obj) & kSdsMask);
+  char* ptr = s + sdslen(s) + 1;
+  return absl::bit_cast<double>(absl::little_endian::Load64(ptr));
+}
+
+using ZsetNode = detail::BPTreeNode<detail::SortedMap::ScoreSds>;
+
+static bool ValidateNode(const ZsetNode* node, detail::SortedMap::ScoreSds ubound) {
+  detail::SortedMap::ScoreSdsPolicy::KeyCompareTo cmp;
+
+  for (unsigned i = 1; i < node->NumItems(); ++i) {
+    if (cmp(node->Key(i - 1), node->Key(i)) >= 0) {
+      LOG(ERROR) << "Key " << i - 1 << " is GE than " << i << ":" << GetObjScore(node->Key(i - 1))
+                 << " vs " << GetObjScore(node->Key(i));
+      return false;
+    }
+  }
+
+  int res = cmp(node->Key(node->NumItems() - 1), ubound);
+  if (res != -1) {
+    LOG(ERROR) << "Last key is not smaller than ubound: "
+               << GetObjScore(node->Key(node->NumItems() - 1)) << " vs " << GetObjScore(ubound);
+    return false;
+  }
+  return true;
+}
+
+static bool ValidateTree(const ZsetNode* root) {
+  // node, upper bound
+  vector<pair<const ZsetNode*, detail::SortedMap::ScoreSds>> stack;
+  char buf[32];
+  detail::SortedMap::ScoreSds plus_inf = detail::SortedMap::BuildKey(HUGE_VAL, true, buf);
+
+  stack.emplace_back(root, plus_inf);
+
+  while (!stack.empty()) {
+    const ZsetNode* node = stack.back().first;
+    detail::SortedMap::ScoreSds ubound = stack.back().second;
+    stack.pop_back();
+
+    if (!ValidateNode(node, ubound))
+      return false;
+
+    if (!node->IsLeaf()) {
+      for (unsigned i = 0; i < node->NumItems(); ++i) {
+        stack.emplace_back(node->Child(i), node->Key(i));
+      }
+      stack.emplace_back(node->Child(node->NumItems()), ubound);
+    }
+  }
+  return true;
+}
+
+static void PrintPath(const detail::BPTreePath<detail::SortedMap::ScoreSds>& path) {
+  string res;
+  char buf[64];
+  for (unsigned i = 0; i < path.Depth(); ++i) {
+    detail::BPTreeNode<detail::SortedMap::ScoreSds>* node = path.Node(i);
+    unsigned pos = path.Position(i);
+    unsigned num_items = node->NumItems();
+    bool last = (i == path.Depth() - 1);
+    const char* type = last ? "=" : "L";
+    void* key_score = nullptr;
+    if (!last && pos == num_items) {
+      key_score = node->Key(pos - 1);
+      type = "R";
+    } else if (pos < num_items) {
+      key_score = node->Key(pos);
+    } else {
+      absl::StrAppend(&res, i, "(INF, ", pos, ") ");
+      continue;
+    }
+    double score = GetObjScore(key_score);
+    char* str = RedisReplyBuilder::FormatDouble(score, buf, sizeof(buf));
+    absl::StrAppend(&res, i, "(", type, " ", str, ", ", pos, ") ");
+  }
+  LOG(ERROR) << "Path@rank=" << path.Rank() << " depth=" << path.Depth() << " " << res;
+}
+
 auto OpRange(const ZSetFamily::ZRangeSpec& range_spec, const OpArgs& op_args, string_view key)
     -> OpResult<ScoredArray> {
   auto res_it = op_args.GetDbSlice().FindReadOnly(op_args.db_cntx, key, OBJ_ZSET);
@@ -1348,6 +1435,46 @@ auto OpRange(const ZSetFamily::ZRangeSpec& range_spec, const OpArgs& op_args, st
   IntervalVisitor iv{Action::RANGE, range_spec.params, &pv};
 
   std::visit(iv, range_spec.interval);
+  if (iv.has_bug) {
+    static atomic_long last{0};
+    long now = time(nullptr);
+    long last_cached = last.load(memory_order_relaxed);
+    if (now - last_cached >= 10 &&
+        last.compare_exchange_strong(last_cached, now, memory_order_relaxed)) {
+      const auto& itv = std::get<ZSetFamily::ScoreInterval>(range_spec.interval);
+      auto* robj = pv.GetRobjWrapper();
+      detail::SortedMap* sm = (detail::SortedMap*)robj->inner_obj();
+      auto* st = sm->get_score_tree();
+      bool path_empty = false;
+      double skey_score;
+      char buf[64];
+
+      {
+        detail::SortedMap::ScoreSds skey =
+            detail::SortedMap::BuildKey(itv.first.val, itv.first.is_open, buf);
+        auto path = st->GEQ(skey);
+        path_empty = path.Empty();
+        skey_score = GetObjScore(skey);
+        if (path_empty) {
+          st->LocateDebug(skey, &path);
+          char buf2[64];
+          char* str = RedisReplyBuilder::FormatDouble(itv.first.val, buf2, sizeof(buf2));
+          LOG(ERROR) << "BUG: " << key << " range from " << str
+                     << " GEQ returned empty, locate path:";
+          PrintPath(path);
+        }
+      }
+
+      char* str = RedisReplyBuilder::FormatDouble(skey_score, buf, sizeof(buf));
+      LOG(ERROR) << "BUG: score_key is: " << str;
+      bool valid = ValidateTree(st->DEBUG_root());
+      LOG_IF(ERROR, !valid) << "BUG: " << key << " tree is invalid";
+      auto path = st->FromRank(0);
+      do {
+        PrintPath(path);
+      } while (path.Next());
+    }
+  }
 
   return iv.PopResult();
 }

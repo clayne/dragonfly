@@ -32,6 +32,7 @@ namespace detail {
  */
 class SortedMap {
  public:
+  mutable bool has_bug = false;
   using ScoredMember = std::pair<std::string, double>;
   using ScoredArray = std::vector<ScoredMember>;
   using ScoreSds = void*;
@@ -92,14 +93,20 @@ class SortedMap {
 
   bool DefragIfNeeded(float ratio);
 
+  static ScoreSds BuildKey(double score, bool is_str_inf, char buf[]);
+
  private:
   using ScoreTree = BPTree<ScoreSds, ScoreSdsPolicy>;
+
+  ScoredArray GetRangeInternal(const zrangespec& r, unsigned offs, unsigned len, bool rev) const;
 
   // hash map from fields to scores.
   ScoreMap* score_map = nullptr;
 
   // sorted tree of (score,field) items.
   ScoreTree* score_tree = nullptr;
+  public:
+   ScoreTree* get_score_tree() { return score_tree; }
 };
 
 // Used by CompactObject.

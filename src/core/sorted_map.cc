@@ -314,8 +314,8 @@ optional<unsigned> SortedMap::GetRank(sds ele, bool reverse) const {
   return *rank;
 }
 
-SortedMap::ScoredArray SortedMap::GetRange(const zrangespec& range, unsigned offset, unsigned limit,
-                                           bool reverse) const {
+SortedMap::ScoredArray SortedMap::GetRangeInternal(const zrangespec& range, unsigned offset,
+                                                   unsigned limit, bool reverse) const {
   ScoredArray arr;
   if (score_tree->Size() <= offset || limit == 0)
     return arr;
@@ -383,6 +383,29 @@ SortedMap::ScoredArray SortedMap::GetRange(const zrangespec& range, unsigned off
   }
 
   return arr;
+}
+
+SortedMap::ScoredArray SortedMap::GetRange(const zrangespec& range, unsigned offset, unsigned limit,
+                                           bool reverse) const {
+  ScoredArray res = GetRangeInternal(range, offset, limit, reverse);
+  if (!res.empty()) {
+    return res;
+  }
+  has_bug = false;
+
+  if (range.max == HUGE_VAL && !reverse && offset == 0) {
+    size_t len = Size();
+    double score = 0;
+    score_tree->Iterate(len - 1, len - 1, [&](ScoreSds ele) {
+       score = GetObjScore(ele);
+       return true;
+    });
+
+    if ((range.min < score) || ((range.min == score) && !range.minex)) {
+      has_bug = true;
+    }
+  }
+  return {};
 }
 
 SortedMap::ScoredArray SortedMap::GetLexRange(const zlexrangespec& range, unsigned offset,
@@ -778,6 +801,10 @@ bool SortedMap::DefragIfNeeded(float ratio) {
   }
 
   return reallocated;
+}
+
+SortedMap::ScoreSds SortedMap::BuildKey(double score, bool is_str_inf, char buf[]) {
+  return BuildScoredKey(score, is_str_inf, buf);
 }
 
 std::optional<SortedMap::RankAndScore> SortedMap::GetRankAndScore(sds ele, bool reverse) const {
